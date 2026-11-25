@@ -1,0 +1,351 @@
+From: mpenelange <191051681+mpenelange@users.noreply.github.com>
+Subject: staging: octeon: hooks for a packet forwarding offload module
+
+Let one module see received packets before the stack does and send a
+packet straight from its receive buffer to the PKO output queue, the
+way Cavium's SDK driver lets its ipfwd offload engine do. The module
+gets its flows from nf_flowtable (hardware offload, through the
+indirect flow block API), so nothing here touches shared structures:
+no sk_buff or net_device fields, no new config symbols, and without a
+module registered the driver behaves as before.
+
+- cvm_oct_offload_register()/_unregister(): one module's receive
+  callback, RCU-protected, called from cvm_oct_poll() before
+  netif_receive_skb(). It can pass the packet, take the work queue
+  entry (after sending it) or take the skb.
+- cvm_oct_offload_xmit(): send a work queue entry from its receive
+  buffers, under the lock cvm_oct_xmit() holds around its PKO send.
+  Packets in flight are capped per port (fwd_queue_depth, 128) in a FAU
+  register of their own, so a flow into a slower port can't drain the
+  packet pool and make RED drop input on every port.
+- cvm_oct_is_offload_port(): whether a netdev is one of our ports.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- /dev/null
++++ b/arch/mips/include/asm/octeon/octeon-ethernet-offload.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Packet forwarding offload for the Octeon ethernet driver
++ * (drivers/staging/octeon): lets one module see received packets before
++ * the stack does, and send a packet straight from its receive buffer.
++ * Without a module registered the driver behaves as before.
++ */
++#ifndef __ASM_OCTEON_ETHERNET_OFFLOAD_H
++#define __ASM_OCTEON_ETHERNET_OFFLOAD_H
++
++#include <linux/types.h>
++
++struct module;
++struct net_device;
++struct sk_buff;
++struct cvmx_wqe;
++
++/* What the receive callback did with a packet */
++enum cvm_oct_rx_result {
++	/* Not taken: the driver passes the packet to the stack */
++	CVM_OCT_RX_PASS,
++	/*
++	 * The callback took the work queue entry and its packet buffers
++	 * (it has sent them with cvm_oct_offload_xmit()). The driver
++	 * leaves an skb that shares the work's buffer alone and frees one
++	 * that doesn't.
++	 */
++	CVM_OCT_RX_TAKEN_WORK,
++	/* The callback took the skb; the driver frees the work as usual */
++	CVM_OCT_RX_TAKEN_SKB,
++};
++
++struct cvm_oct_offload_ops {
++	struct module *owner;
++	/*
++	 * Called in NAPI context for every packet received on a port that
++	 * is up, before the stack sees it. @skb shares @work's buffer when
++	 * the packet fits in one.
++	 */
++	enum cvm_oct_rx_result (*rx)(struct net_device *dev,
++				     struct cvmx_wqe *work,
++				     struct sk_buff *skb);
++};
++
++int cvm_oct_offload_register(const struct cvm_oct_offload_ops *ops);
++void cvm_oct_offload_unregister(const struct cvm_oct_offload_ops *ops);
++
++/* True if @dev is a port of this driver (so cvm_oct_offload_xmit() works) */
++bool cvm_oct_is_offload_port(const struct net_device *dev);
++
++/*
++ * Send @work's packet out of @dev from its receive buffers, which the
++ * hardware then returns to the pool; the work queue entry is freed. On
++ * failure (port down or too many packets queued) the work and its buffers
++ * are freed and a negative errno returned. @l3_offset: offset of an IPv4
++ * header in the packet, to have the hardware fill in its TCP/UDP checksum;
++ * 0 sends the packet's checksums as they are.
++ */
++int cvm_oct_offload_xmit(struct net_device *dev, struct cvmx_wqe *work,
++			 int qos, unsigned int l3_offset);
++
++#endif /* __ASM_OCTEON_ETHERNET_OFFLOAD_H */
+--- a/drivers/staging/octeon/ethernet.c
++++ b/drivers/staging/octeon/ethernet.c
+@@ -192,6 +192,69 @@ int cvm_oct_free_work(void *work_queue_e
+ }
+ EXPORT_SYMBOL(cvm_oct_free_work);
+ 
++#ifdef CONFIG_CAVIUM_OCTEON_SOC
++/* The forwarding offload module's callbacks, if one is registered */
++static const struct cvm_oct_offload_ops __rcu *cvm_oct_offload;
++static DEFINE_MUTEX(cvm_oct_offload_lock);
++
++int cvm_oct_offload_register(const struct cvm_oct_offload_ops *ops)
++{
++	int ret = 0;
++
++	mutex_lock(&cvm_oct_offload_lock);
++	if (rcu_access_pointer(cvm_oct_offload))
++		ret = -EBUSY;
++	else
++		rcu_assign_pointer(cvm_oct_offload, ops);
++	mutex_unlock(&cvm_oct_offload_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(cvm_oct_offload_register);
++
++void cvm_oct_offload_unregister(const struct cvm_oct_offload_ops *ops)
++{
++	mutex_lock(&cvm_oct_offload_lock);
++	if (rcu_access_pointer(cvm_oct_offload) == ops)
++		RCU_INIT_POINTER(cvm_oct_offload, NULL);
++	mutex_unlock(&cvm_oct_offload_lock);
++	/* No receive callback still running when the module goes away */
++	synchronize_net();
++}
++EXPORT_SYMBOL_GPL(cvm_oct_offload_unregister);
++
++enum cvm_oct_rx_result cvm_oct_offload_rx(struct net_device *dev,
++					  struct cvmx_wqe *work,
++					  struct sk_buff *skb)
++{
++	const struct cvm_oct_offload_ops *ops;
++	enum cvm_oct_rx_result ret = CVM_OCT_RX_PASS;
++
++	rcu_read_lock();
++	ops = rcu_dereference(cvm_oct_offload);
++	if (ops)
++		ret = ops->rx(dev, work, skb);
++	rcu_read_unlock();
++	return ret;
++}
++
++static const struct net_device_ops cvm_oct_npi_netdev_ops;
++static const struct net_device_ops cvm_oct_xaui_netdev_ops;
++static const struct net_device_ops cvm_oct_sgmii_netdev_ops;
++static const struct net_device_ops cvm_oct_spi_netdev_ops;
++static const struct net_device_ops cvm_oct_rgmii_netdev_ops;
++
++bool cvm_oct_is_offload_port(const struct net_device *dev)
++{
++	/* Hardware ports only (not the POW device) */
++	return dev->netdev_ops == &cvm_oct_sgmii_netdev_ops ||
++	       dev->netdev_ops == &cvm_oct_rgmii_netdev_ops ||
++	       dev->netdev_ops == &cvm_oct_xaui_netdev_ops ||
++	       dev->netdev_ops == &cvm_oct_spi_netdev_ops ||
++	       dev->netdev_ops == &cvm_oct_npi_netdev_ops;
++}
++EXPORT_SYMBOL_GPL(cvm_oct_is_offload_port);
++#endif /* CONFIG_CAVIUM_OCTEON_SOC */
++
+ /**
+  * cvm_oct_common_get_stats - get the low level ethernet statistics
+  * @dev:    Device to get the statistics from
+@@ -882,6 +945,9 @@ static int cvm_oct_probe(struct platform
+ 			for (qos = 0; qos < cvmx_pko_get_num_queues(port);
+ 			     qos++)
+ 				cvmx_fau_atomic_write32(priv->fau + qos * 4, 0);
++			/* One more FAU below the queues' for the offload */
++			priv->fwd_fau = priv->fau - sizeof(u32);
++			cvmx_fau_atomic_write32(priv->fwd_fau, 0);
+ 			dev->min_mtu = VLAN_ETH_ZLEN - mtu_overhead;
+ 			dev->max_mtu = OCTEON_MAX_MTU - mtu_overhead;
+ 
+@@ -953,6 +1019,7 @@ static int cvm_oct_probe(struct platform
+ 				fau -=
+ 				    cvmx_pko_get_num_queues(priv->port) *
+ 				    sizeof(u32);
++				fau -= sizeof(u32);	/* priv->fwd_fau */
+ 				schedule_delayed_work(&priv->port_periodic_work,
+ 						      HZ);
+ 			}
+--- a/drivers/staging/octeon/ethernet-rx.c
++++ b/drivers/staging/octeon/ethernet-rx.c
+@@ -216,6 +216,7 @@ static int cvm_oct_poll(struct oct_rx_gr
+ 		int skb_in_hw;
+ 		struct cvmx_wqe *work;
+ 		int port;
++		enum cvm_oct_rx_result offload = CVM_OCT_RX_PASS;
+ 
+ 		if (USE_ASYNC_IOBDMA && did_work_request)
+ 			work = cvmx_pow_work_response_async(CVMX_SCR_SCRATCH);
+@@ -344,7 +345,12 @@ static int cvm_oct_poll(struct oct_rx_gr
+ 					dev->stats.rx_packets++;
+ 					dev->stats.rx_bytes += skb->len;
+ 				}
+-				netif_receive_skb(skb);
++				offload = cvm_oct_offload_rx(dev, work, skb);
++				if (offload == CVM_OCT_RX_PASS)
++					netif_receive_skb(skb);
++				else if (offload == CVM_OCT_RX_TAKEN_WORK &&
++					 !packet_not_copied)
++					dev_kfree_skb_irq(skb);
+ 			} else {
+ 				/*
+ 				 * Drop any packet received for a device that
+@@ -362,6 +368,9 @@ static int cvm_oct_poll(struct oct_rx_gr
+ 					   port);
+ 			dev_kfree_skb_irq(skb);
+ 		}
++		/* The offload sent the work's buffers, which go back to the pool */
++		if (offload == CVM_OCT_RX_TAKEN_WORK)
++			continue;
+ 		/*
+ 		 * Check to see if the skbuff and work share the same
+ 		 * packet buffer.
+--- a/drivers/staging/octeon/ethernet-tx.c
++++ b/drivers/staging/octeon/ethernet-tx.c
+@@ -714,3 +714,82 @@ void cvm_oct_tx_shutdown(void)
+ 
+ 	tasklet_kill(&cvm_oct_tx_cleanup_tasklet);
+ }
++
++#ifdef CONFIG_CAVIUM_OCTEON_SOC
++/*
++ * Packets the offload forwards are sent from their receive buffers, which
++ * come from the FPA packet pool; once the pool runs low, RED drops input on
++ * every port. So a flow forwarded into a slower port must not queue without
++ * limit: cap the packets in flight per port, in the port's own FAU
++ * (priv->fwd_fau), which PKO decrements as each packet goes out.
++ */
++static int fwd_queue_depth = 128;
++module_param(fwd_queue_depth, int, 0644);
++MODULE_PARM_DESC(fwd_queue_depth, "Most packets the forwarding offload may have queued per port");
++
++int cvm_oct_offload_xmit(struct net_device *dev, struct cvmx_wqe *work,
++			 int qos, unsigned int l3_offset)
++{
++	struct octeon_ethernet *priv = netdev_priv(dev);
++	union cvmx_pko_command_word0 pko_command;
++	union cvmx_buf_ptr hw_buffer;
++	unsigned long flags;
++	int ret = 0;
++
++	if (unlikely(!(dev->flags & IFF_UP))) {
++		ret = -ENETDOWN;
++		goto drop;
++	}
++	if (qos < 0 || qos >= cvmx_pko_get_num_queues(priv->port))
++		qos = 0;
++
++	if (unlikely(cvmx_fau_fetch_and_add32(priv->fwd_fau, 1) >=
++		     READ_ONCE(fwd_queue_depth))) {
++		cvmx_fau_atomic_add32(priv->fwd_fau, -1);
++		ret = -ENOBUFS;
++		goto drop;
++	}
++
++	hw_buffer.u64 = 0;
++	hw_buffer.s.addr = work->packet_ptr.s.addr;
++	hw_buffer.s.pool = CVMX_FPA_PACKET_POOL;
++	hw_buffer.s.size = CVMX_FPA_PACKET_POOL_SIZE;
++	hw_buffer.s.back = work->packet_ptr.s.back;
++
++	pko_command.u64 = 0;
++	/* The headers were just rewritten: keep them in L2 */
++	pko_command.s.n2 = 0;
++	pko_command.s.segs = work->word2.s.bufs;
++	pko_command.s.total_bytes = work->word1.len;
++	/* PKO decrements the port's in-flight count once the packet is out */
++	pko_command.s.size0 = CVMX_FAU_OP_SIZE_32;
++	pko_command.s.subone0 = 1;
++	pko_command.s.reg0 = priv->fwd_fau;
++	/* 0 leaves the checksums alone */
++	pko_command.s.ipoffp1 = l3_offset ? l3_offset + 1 : 0;
++
++	/* cvm_oct_xmit() holds this lock around its own PKO send */
++	spin_lock_irqsave(&priv->tx_free_list[qos].lock, flags);
++	cvmx_pko_send_packet_prepare(priv->port, priv->queue + qos,
++				     CVMX_PKO_LOCK_NONE);
++	if (unlikely(cvmx_pko_send_packet_finish(priv->port, priv->queue + qos,
++						 pko_command, hw_buffer,
++						 CVMX_PKO_LOCK_NONE)))
++		ret = -EIO;
++	spin_unlock_irqrestore(&priv->tx_free_list[qos].lock, flags);
++
++	if (unlikely(ret)) {
++		cvmx_fau_atomic_add32(priv->fwd_fau, -1);
++		goto drop;
++	}
++	/* PKO frees the packet buffers; the work queue entry is ours */
++	cvmx_fpa_free(work, CVMX_FPA_WQE_POOL, 1);
++	return 0;
++
++drop:
++	dev->stats.tx_dropped++;
++	cvm_oct_free_work(work);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(cvm_oct_offload_xmit);
++#endif /* CONFIG_CAVIUM_OCTEON_SOC */
+--- a/drivers/staging/octeon/octeon-ethernet.h
++++ b/drivers/staging/octeon/octeon-ethernet.h
+@@ -36,6 +36,7 @@
+ #include <asm/octeon/cvmx-spxx-defs.h>
+ #include <asm/octeon/cvmx-stxx-defs.h>
+ #include <asm/octeon/cvmx-wqe.h>
++#include <asm/octeon/octeon-ethernet-offload.h>
+ 
+ #else
+ 
+@@ -73,6 +74,8 @@ struct octeon_ethernet {
+ 	void (*poll)(struct net_device *dev);
+ 	struct delayed_work	port_periodic_work;
+ 	struct device_node	*of_node;
++	/* FAU counting the offload's packets in flight on this port */
++	int fwd_fau;
+ };
+ 
+ struct oct_rx_group {
+@@ -90,6 +93,20 @@ struct octeon_ethernet_platform {
+ 
+ int cvm_oct_free_work(void *work_queue_entry);
+ 
++/* Forwarding offload (ethernet.c, asm/octeon/octeon-ethernet-offload.h) */
++#ifdef CONFIG_CAVIUM_OCTEON_SOC
++enum cvm_oct_rx_result cvm_oct_offload_rx(struct net_device *dev,
++					  struct cvmx_wqe *work,
++					  struct sk_buff *skb);
++#else
++static inline enum cvm_oct_rx_result
++cvm_oct_offload_rx(struct net_device *dev, struct cvmx_wqe *work,
++		   struct sk_buff *skb)
++{
++	return CVM_OCT_RX_PASS;
++}
++#endif
++
+ int cvm_oct_rgmii_open(struct net_device *dev);
+ 
+ int cvm_oct_sgmii_init(struct net_device *dev);
+--- a/drivers/staging/octeon/octeon-stubs.h
++++ b/drivers/staging/octeon/octeon-stubs.h
+@@ -1431,3 +1431,10 @@ static inline void cvmx_pow_work_submit(
+ #define CVMX_SSO_WQ_INT_THRX(a)		(a)
+ #define CVMX_STXX_INT_MSK(a)		(a)
+ #define CVMX_STXX_INT_REG(a)		(a)
++
++/* Forwarding offload (asm/octeon/octeon-ethernet-offload.h) */
++enum cvm_oct_rx_result {
++	CVM_OCT_RX_PASS,
++	CVM_OCT_RX_TAKEN_WORK,
++	CVM_OCT_RX_TAKEN_SKB,
++};
