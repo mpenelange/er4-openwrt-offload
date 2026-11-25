@@ -169,17 +169,29 @@ jobs:
             fi
           done
 
-      - name: Publish
-        if: steps.rel.outputs.skip != 'true' && steps.rel.outputs.publish == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REL: ${{ steps.rel.outputs.release }}
+      - name: Collect the images
+        if: steps.rel.outputs.skip != 'true'
         run: |
           bin=openwrt/bin/targets/$TARGET
           mkdir out
           cp "$bin"/*ubnt_edgerouter-4-squashfs-sysupgrade.tar "$bin"/*ubnt_edgerouter-4-initramfs-kernel.bin "$bin"/*.manifest out/
           cp "$bin"/packages/kmod-octeon-offload-*.apk out/
           (cd out && sha256sum * > sha256sums)
+
+      # kept with the run too, so a failed publish doesn't lose the build
+      - uses: actions/upload-artifact@v4
+        if: steps.rel.outputs.skip != 'true'
+        with:
+          name: er4-${{ steps.rel.outputs.release }}
+          path: out/
+          retention-days: 14
+
+      - name: Publish
+        if: steps.rel.outputs.skip != 'true' && steps.rel.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL: ${{ steps.rel.outputs.release }}
+        run: |
           kernel=$(grep '^kernel - ' out/*.manifest | cut -d' ' -f3)
           notes="OpenWrt $REL for the Ubiquiti EdgeRouter 4 with patch 703 and kmod-octeon-offload.
           Kernel $kernel: the same as the official release, so packages and kmods from downloads.openwrt.org install.
