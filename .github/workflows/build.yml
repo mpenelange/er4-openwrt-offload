@@ -1,38 +1,62 @@
-# Builds the EdgeRouter 4 image for an OpenWrt release: the release's own config plus patch 703
-# and kmod-octeon-offload, checks that the kernel matches the official one (so official kmods
-# install), and publishes the images and the kmod as a GitHub release "openwrt-<version>".
+# Builds the EdgeRouter 4 image: OpenWrt's own config plus patch 703 and kmod-octeon-offload.
 #
-# Runs when a push changes the patch, the kmod or this file (rebuilds the newest point release of
-# SERIES and replaces its files), by hand for any release, or weekly (builds a new point release
-# of SERIES if it has no release here yet).
+# Branches follow OpenWrt's: openwrt-25.12 builds OpenWrt 25.12 releases, a later openwrt-26.xx
+# builds 26.xx, and main builds OpenWrt main (a snapshot, as an early warning for the next
+# kernel; never published). The patch comes from patches/octeon-<kernel>/, for whatever kernel
+# that OpenWrt uses.
+#
+# A release build checks that the kernel matches the official release (so official kmods install)
+# and publishes the images and the kmod as the GitHub release "openwrt-<version>".
+#
+# Runs on a push that changes the patch, the kmod or this file (the newest release of the branch's
+# series, replacing that release's files), by hand (any release of the series), and weekly: main
+# starts a build on every openwrt-* branch, which builds a new point release if it has none here.
 name: Build
 
 on:
   workflow_dispatch:
     inputs:
       release:
-        description: 'OpenWrt release, e.g. 25.12.6 (empty: the newest of the series)'
+        description: 'OpenWrt release, e.g. 25.12.6 (empty: the newest of the branch''s series)'
         required: false
+      only_new:
+        description: 'Only if that release has no GitHub release here yet'
+        type: boolean
+        default: false
   push:
-    branches: [ main ]
+    branches: [ 'openwrt-*' ]
     paths: [ 'patches/**', 'package/**', '.github/workflows/build.yml' ]
   schedule:
     - cron: '17 5 * * 1'
 
-# One build at a time. A push cancels one still running (the newer code wins); other runs wait.
+# One build per branch at a time. A push cancels one still running (the newer code wins).
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
-  SERIES: '25.12'
   TARGET: octeon/generic
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
+  # Weekly, on the default branch: start a build on every openwrt-* branch
+  weekly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for b in $(gh api "repos/$GITHUB_REPOSITORY/branches" --paginate -q '.[].name' | grep '^openwrt-'); do
+            echo "build on $b"
+            gh workflow run build.yml -R "$GITHUB_REPOSITORY" --ref "$b" -f only_new=true
+          done
+
   build:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -45,18 +69,39 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT: ${{ inputs.release }}
+          ONLY_NEW: ${{ inputs.only_new }}
         run: |
-          rel=$INPUT
-          if [ -z "$rel" ]; then
-            rel=$(curl -fsSL https://downloads.openwrt.org/releases/ | grep -oE "href=\"${SERIES//./\\.}\.[0-9]+/" \
-              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1)
-          fi
-          [ -n "$rel" ] || { echo "no release found"; exit 1; }
-          echo "release=$rel" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.event_name }}" = schedule ] && gh release view "openwrt-$rel" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "openwrt-$rel is already built"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
+          case "$GITHUB_REF_NAME" in
+          openwrt-*)
+            series=${GITHUB_REF_NAME#openwrt-}
+            rel=$INPUT
+            if [ -z "$rel" ]; then
+              rel=$(curl -fsSL https://downloads.openwrt.org/releases/ | grep -oE "href=\"${series//./\\.}\.[0-9]+/" \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1)
+            fi
+            [ -n "$rel" ] || { echo "::notice::no OpenWrt $series release yet"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+            case "$rel" in "$series".*) ;; *) echo "::error::$rel isn't an OpenWrt $series release"; exit 1 ;; esac
+            if [ "$ONLY_NEW" = true ] && gh release view "openwrt-$rel" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "openwrt-$rel is already built"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+            {
+              echo "release=$rel"
+              echo "ref=v$rel"
+              echo "dl=https://downloads.openwrt.org/releases/$rel/targets/$TARGET"
+              echo "publish=true"
+            } >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            # OpenWrt main: a snapshot build, checked but never published
+            {
+              echo "release=snapshot"
+              echo "ref=main"
+              echo "dl=https://downloads.openwrt.org/snapshots/targets/$TARGET"
+              echo "publish=false"
+            } >> "$GITHUB_OUTPUT"
+            ;;
+          esac
 
       - name: Free disk space
         if: steps.rel.outputs.skip != 'true'
@@ -74,17 +119,22 @@ jobs:
       - name: OpenWrt, the patch and the kmod
         if: steps.rel.outputs.skip != 'true'
         env:
-          REL: ${{ steps.rel.outputs.release }}
+          REF: ${{ steps.rel.outputs.ref }}
+          DL: ${{ steps.rel.outputs.dl }}
         run: |
           # a full clone: base-files numbers itself by counting commits
-          git clone --branch "v$REL" https://github.com/openwrt/openwrt.git openwrt
+          git clone --branch "$REF" https://github.com/openwrt/openwrt.git openwrt
           cd openwrt
-          cp ../src/patches/octeon-6.12/*.patch target/linux/octeon/patches-6.12/
+          # the patch for the kernel this OpenWrt uses
+          kv=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/octeon/Makefile)
+          echo "OpenWrt $REF builds octeon with kernel $kv"
+          [ -d "../src/patches/octeon-$kv" ] || { echo "::error::no patch for kernel $kv: patches/octeon-$kv/ is missing (port patch 703 first)"; exit 1; }
+          cp ../src/patches/octeon-$kv/*.patch "target/linux/octeon/patches-$kv/"
           cp -r ../src/package/kernel/octeon-offload package/kernel/
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          curl -fsSL "https://downloads.openwrt.org/releases/$REL/targets/$TARGET/config.buildinfo" -o .config
-          # The release config decides the kernel's vermagic and stays as it is. Only what doesn't
+          curl -fsSL "$DL/config.buildinfo" -o .config
+          # The official config decides the kernel's vermagic and stays as it is. Only what doesn't
           # touch the kernel config is turned off: the SDK, ImageBuilder, toolchain tarball and
           # all userspace packages (hours of building nobody here uses).
           sed -i -e '/^CONFIG_SDK=/d' -e '/^CONFIG_IB=/d' -e '/^CONFIG_MAKE_TOOLCHAIN=/d' -e '/^CONFIG_ALL_NONSHARED=/d' .config
@@ -101,21 +151,26 @@ jobs:
           make -j"$(($(nproc) + 1))" IGNORE_ERRORS=m || make -j1 V=s IGNORE_ERRORS=m
           df -h /
 
-      - name: Same kernel as the official release
+      - name: Same kernel as the official build
         if: steps.rel.outputs.skip != 'true'
         env:
-          REL: ${{ steps.rel.outputs.release }}
+          DL: ${{ steps.rel.outputs.dl }}
+          PUBLISH: ${{ steps.rel.outputs.publish }}
         run: |
           bin=openwrt/bin/targets/$TARGET
-          curl -fsSL "https://downloads.openwrt.org/releases/$REL/targets/$TARGET/openwrt-$REL-${TARGET//\//-}.manifest" -o official.manifest
+          curl -fsSL "$DL/$(basename "$bin"/*.manifest)" -o official.manifest
           for p in kernel kmod-nft-offload; do
             a=$(grep "^$p - " official.manifest); b=$(grep "^$p - " "$bin"/*.manifest)
             echo "built:    $b"; echo "official: $a"
-            [ "$a" = "$b" ] || { echo "::error::$p differs from the official release"; exit 1; }
+            if [ "$a" != "$b" ]; then
+              # a snapshot moves on daily, so there it's only a note
+              [ "$PUBLISH" = true ] && { echo "::error::$p differs from the official release"; exit 1; }
+              echo "::warning::$p differs from today's official snapshot"
+            fi
           done
 
       - name: Publish
-        if: steps.rel.outputs.skip != 'true'
+        if: steps.rel.outputs.skip != 'true' && steps.rel.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REL: ${{ steps.rel.outputs.release }}
@@ -128,7 +183,7 @@ jobs:
           kernel=$(grep '^kernel - ' out/*.manifest | cut -d' ' -f3)
           notes="OpenWrt $REL for the Ubiquiti EdgeRouter 4 with patch 703 and kmod-octeon-offload.
           Kernel $kernel: the same as the official release, so packages and kmods from downloads.openwrt.org install.
-          Built from $(git -C src rev-parse --short HEAD)."
+          Built from $GITHUB_REF_NAME at $(git -C src rev-parse --short HEAD)."
           if gh release view "openwrt-$REL" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # rebuilt (new code, or by hand): the files and the notes say which commit they're from now
             gh release upload "openwrt-$REL" out/* --clobber -R "$GITHUB_REPOSITORY"
