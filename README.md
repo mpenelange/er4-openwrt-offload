@@ -9,8 +9,6 @@ release, so official packages and kmods still install.
 Offloads IPv4/IPv6 TCP and UDP between the ethernet ports, IPv4 NAT, and single 802.1Q tags.
 PPPoE, IPv6 NAT, tunnels and so on stay in the software path.
 
-Experimental: tested on one ER-4 running 25.12.6.
-
 ## Build
 
 ```sh
