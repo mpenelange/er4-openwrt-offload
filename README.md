@@ -24,4 +24,8 @@ make defconfig && make -j$(nproc) IGNORE_ERRORS=m
 
 Install the sysupgrade image as usual. Counters are in `/proc/octeon_offload`.
 
+Ready-built images and the kmod for each 25.12 release are on the
+[releases page](https://github.com/mpenelange/er4-openwrt-offload/releases), built by
+`.github/workflows/build.yml`.
+
 GPL-2.0.

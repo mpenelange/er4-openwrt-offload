@@ -1,0 +1,127 @@
+# Builds the EdgeRouter 4 image for an OpenWrt release: the release's own config plus patch 703
+# and kmod-octeon-offload, checks that the kernel matches the official one (so official kmods
+# install), and publishes the images and the kmod as a GitHub release "openwrt-<version>".
+#
+# Run by hand for a release, or weekly: then it builds the newest point release of SERIES if it
+# has no release here yet.
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'OpenWrt release, e.g. 25.12.6 (empty: the newest of the series)'
+        required: false
+  schedule:
+    - cron: '17 5 * * 1'
+
+env:
+  SERIES: '25.12'
+  TARGET: octeon/generic
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Pick the release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT: ${{ inputs.release }}
+        run: |
+          rel=$INPUT
+          if [ -z "$rel" ]; then
+            rel=$(curl -fsSL https://downloads.openwrt.org/releases/ | grep -oE "href=\"${SERIES//./\\.}\.[0-9]+/" \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1)
+          fi
+          [ -n "$rel" ] || { echo "no release found"; exit 1; }
+          echo "release=$rel" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = schedule ] && gh release view "openwrt-$rel" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "openwrt-$rel is already built"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Free disk space
+        if: steps.rel.outputs.skip != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Build prerequisites
+        if: steps.rel.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev file wget zstd
+
+      - name: OpenWrt, the patch and the kmod
+        if: steps.rel.outputs.skip != 'true'
+        env:
+          REL: ${{ steps.rel.outputs.release }}
+        run: |
+          # a full clone: base-files numbers itself by counting commits
+          git clone --branch "v$REL" https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          cp ../src/patches/octeon-6.12/*.patch target/linux/octeon/patches-6.12/
+          cp -r ../src/package/kernel/octeon-offload package/kernel/
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          curl -fsSL "https://downloads.openwrt.org/releases/$REL/targets/$TARGET/config.buildinfo" -o .config
+          # The release config decides the kernel's vermagic and stays as it is. Only what doesn't
+          # touch the kernel config is turned off: the SDK, ImageBuilder, toolchain tarball and
+          # all userspace packages (hours of building nobody here uses).
+          sed -i -e '/^CONFIG_SDK=/d' -e '/^CONFIG_IB=/d' -e '/^CONFIG_MAKE_TOOLCHAIN=/d' -e '/^CONFIG_ALL_NONSHARED=/d' .config
+          printf '%s\n' 'CONFIG_PACKAGE_kmod-octeon-offload=y' '# CONFIG_SDK is not set' '# CONFIG_IB is not set' \
+            '# CONFIG_MAKE_TOOLCHAIN is not set' '# CONFIG_ALL_NONSHARED is not set' >> .config
+          make defconfig
+          grep -q '^CONFIG_PACKAGE_kmod-octeon-offload=y' .config
+
+      - name: Build
+        if: steps.rel.outputs.skip != 'true'
+        working-directory: openwrt
+        run: |
+          make -j"$(nproc)" download
+          make -j"$(($(nproc) + 1))" IGNORE_ERRORS=m || make -j1 V=s IGNORE_ERRORS=m
+          df -h /
+
+      - name: Same kernel as the official release
+        if: steps.rel.outputs.skip != 'true'
+        env:
+          REL: ${{ steps.rel.outputs.release }}
+        run: |
+          bin=openwrt/bin/targets/$TARGET
+          curl -fsSL "https://downloads.openwrt.org/releases/$REL/targets/$TARGET/openwrt-$REL-${TARGET//\//-}.manifest" -o official.manifest
+          for p in kernel kmod-nft-offload; do
+            a=$(grep "^$p - " official.manifest); b=$(grep "^$p - " "$bin"/*.manifest)
+            echo "built:    $b"; echo "official: $a"
+            [ "$a" = "$b" ] || { echo "::error::$p differs from the official release"; exit 1; }
+          done
+
+      - name: Publish
+        if: steps.rel.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL: ${{ steps.rel.outputs.release }}
+        run: |
+          bin=openwrt/bin/targets/$TARGET
+          mkdir out
+          cp "$bin"/*ubnt_edgerouter-4-squashfs-sysupgrade.tar "$bin"/*ubnt_edgerouter-4-initramfs-kernel.bin "$bin"/*.manifest out/
+          cp "$bin"/packages/kmod-octeon-offload-*.apk out/
+          (cd out && sha256sum * > sha256sums)
+          kernel=$(grep '^kernel - ' out/*.manifest | cut -d' ' -f3)
+          notes="OpenWrt $REL for the Ubiquiti EdgeRouter 4 with patch 703 and kmod-octeon-offload.
+          Kernel $kernel: the same as the official release, so packages and kmods from downloads.openwrt.org install.
+          Built from $(git -C src rev-parse --short HEAD)."
+          if gh release view "openwrt-$REL" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "openwrt-$REL" out/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "openwrt-$REL" out/* -R "$GITHUB_REPOSITORY" --title "OpenWrt $REL for the EdgeRouter 4" --notes "$notes" --target "$GITHUB_SHA"
+          fi
