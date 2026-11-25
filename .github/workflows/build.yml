@@ -2,8 +2,9 @@
 # and kmod-octeon-offload, checks that the kernel matches the official one (so official kmods
 # install), and publishes the images and the kmod as a GitHub release "openwrt-<version>".
 #
-# Run by hand for a release, or weekly: then it builds the newest point release of SERIES if it
-# has no release here yet.
+# Runs when a push changes the patch, the kmod or this file (rebuilds the newest point release of
+# SERIES and replaces its files), by hand for any release, or weekly (builds a new point release
+# of SERIES if it has no release here yet).
 name: Build
 
 on:
@@ -12,8 +13,16 @@ on:
       release:
         description: 'OpenWrt release, e.g. 25.12.6 (empty: the newest of the series)'
         required: false
+  push:
+    branches: [ main ]
+    paths: [ 'patches/**', 'package/**', '.github/workflows/build.yml' ]
   schedule:
     - cron: '17 5 * * 1'
+
+# One build at a time. A push cancels one still running (the newer code wins); other runs wait.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   SERIES: '25.12'
@@ -121,7 +130,9 @@ jobs:
           Kernel $kernel: the same as the official release, so packages and kmods from downloads.openwrt.org install.
           Built from $(git -C src rev-parse --short HEAD)."
           if gh release view "openwrt-$REL" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # rebuilt (new code, or by hand): the files and the notes say which commit they're from now
             gh release upload "openwrt-$REL" out/* --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "openwrt-$REL" --notes "$notes" -R "$GITHUB_REPOSITORY"
           else
             gh release create "openwrt-$REL" out/* -R "$GITHUB_REPOSITORY" --title "OpenWrt $REL for the EdgeRouter 4" --notes "$notes" --target "$GITHUB_SHA"
           fi
